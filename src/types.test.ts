@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest'
-import { DocumentSchema, PageSchema } from './types'
-import { validCropQuad } from './services/image'
+import { DocumentSchema, PageSchema, type Page, type ScanDocument } from './types'
+import { cappedCropSize, orderQuad, validCropQuad } from './services/image'
+import { pageSizeFor } from './services/export'
+import { orderedDocumentPages } from './services/storage'
 
 describe('LocalScan manifest validation', () => {
   it('accepts a persisted document and page', () => {
@@ -19,5 +21,35 @@ describe('LocalScan manifest validation', () => {
 
   it('rejects a self-intersecting or out-of-bounds crop', () => {
     expect(validCropQuad([{ x: -2, y: 10 }, { x: 1100, y: 10 }, { x: 20, y: 1000 }, { x: 1000, y: 900 }], 1200, 1200)).toBe(false)
+  })
+
+  it('orders shuffled corners without duplicate-corner ambiguity', () => {
+    expect(orderQuad([{ x: 1000, y: 900 }, { x: 80, y: 900 }, { x: 980, y: 100 }, { x: 120, y: 80 }])).toEqual([
+      { x: 120, y: 80 }, { x: 980, y: 100 }, { x: 1000, y: 900 }, { x: 80, y: 900 },
+    ])
+    expect(orderQuad([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 40, y: 30 }, { x: 0, y: 100 }])).toBeUndefined()
+  })
+
+  it('caps perspective output allocation while preserving its ratio', () => {
+    const size = cappedCropSize(12000, 9000)
+    expect(size).toBeDefined()
+    expect(size!.width).toBeLessThanOrEqual(4096)
+    expect(size!.width * size!.height).toBeLessThanOrEqual(12_000_000)
+    expect(size!.width / size!.height).toBeCloseTo(4 / 3, 2)
+  })
+
+  it('uses the selected PDF page size and keeps original scan aspect ratio', () => {
+    const page = { width: 1600, height: 1000 } as Page
+    expect(pageSizeFor(page, 'letter')).toEqual({ width: 612, height: 792 })
+    const original = pageSizeFor(page, 'original')
+    expect(original.width / original.height).toBeCloseTo(1.6, 2)
+  })
+
+  it('treats the document page list as authoritative over stale stored pages', () => {
+    const document = { pageIds: ['second', 'first'] } as ScanDocument
+    const first = { id: 'first', order: 0 } as Page
+    const second = { id: 'second', order: 1 } as Page
+    const stale = { id: 'deleted', order: 2 } as Page
+    expect(orderedDocumentPages(document, [first, stale, second]).map(page => page.id)).toEqual(['second', 'first'])
   })
 })

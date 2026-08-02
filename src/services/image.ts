@@ -173,38 +173,50 @@ export type Quad = [Point, Point, Point, Point]
 /** Return corners in the only order accepted by the homography: TL, TR, BR, BL. */
 export function orderQuad(points: Point[]): Quad | undefined {
   if (points.length !== 4 || points.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return undefined
-  let tl = points[0]
-  let tr = points[0]
-  let br = points[0]
-  let bl = points[0]
-  let minSum = Infinity
-  let maxSum = -Infinity
-  let minDiff = Infinity
-  let maxDiff = -Infinity
-  for (const point of points) {
-    const sum = point.x + point.y
-    const diff = point.x - point.y
-    if (sum < minSum) { minSum = sum; tl = point }
-    if (sum > maxSum) { maxSum = sum; br = point }
-    if (diff > maxDiff) { maxDiff = diff; tr = point }
-    if (diff < minDiff) { minDiff = diff; bl = point }
+  // Sum/difference ordering fails on diamonds and near-square perspective
+  // crops because two corners can have the same sum. Sort around the centre
+  // first, then rotate the clockwise loop so it begins at the visual TL.
+  const unique = new Set(points.map(point => `${point.x}:${point.y}`))
+  if (unique.size !== 4) return undefined
+  const centre = points.reduce((sum, point) => ({ x: sum.x + point.x / 4, y: sum.y + point.y / 4 }), { x: 0, y: 0 })
+  const loop = [...points].sort((a, b) => Math.atan2(a.y - centre.y, a.x - centre.x) - Math.atan2(b.y - centre.y, b.x - centre.x))
+  let start = 0
+  for (let index = 1; index < loop.length; index++) {
+    const candidate = loop[index]
+    const current = loop[start]
+    if (candidate.x + candidate.y < current.x + current.y || (candidate.x + candidate.y === current.x + current.y && candidate.y < current.y)) start = index
   }
-  const quad: Quad = [tl, tr, br, bl]
-  const area = Math.abs(quad.reduce((sum, point, index) => {
-    const next = quad[(index + 1) % quad.length]
+  const quad = [loop[start], loop[(start + 1) % 4], loop[(start + 2) % 4], loop[(start + 3) % 4]] as Quad
+  return isConvexQuad(quad) && polygonArea(quad) > 4 ? quad : undefined
+}
+
+function polygonArea(points: Point[]) {
+  return Math.abs(points.reduce((sum, point, index) => {
+    const next = points[(index + 1) % points.length]
     return sum + point.x * next.y - next.x * point.y
   }, 0)) / 2
-  return area > 4 ? quad : undefined
+}
+
+function isConvexQuad(points: Quad) {
+  let sign = 0
+  for (let index = 0; index < 4; index++) {
+    const a = points[index]
+    const b = points[(index + 1) % 4]
+    const c = points[(index + 2) % 4]
+    const cross = (b.x - a.x) * (c.y - b.y) - (b.y - a.y) * (c.x - b.x)
+    if (Math.abs(cross) < .0001) return false
+    const nextSign = Math.sign(cross)
+    if (sign && sign !== nextSign) return false
+    sign = nextSign
+  }
+  return true
 }
 
 /** Reject noisy/default detector output before attempting a destructive crop. */
 export function validQuad(points: Point[], width: number, height: number) {
   const quad = orderQuad(points)
   if (!quad || width < 2 || height < 2) return false
-  const area = Math.abs(quad.reduce((sum, point, index) => {
-    const next = quad[(index + 1) % quad.length]
-    return sum + point.x * next.y - next.x * point.y
-  }, 0)) / 2
+  const area = polygonArea(quad)
   const edgeLengths = quad.map((point, index) => {
     const next = quad[(index + 1) % quad.length]
     return Math.hypot(next.x - point.x, next.y - point.y)
@@ -219,10 +231,7 @@ export function validQuad(points: Point[], width: number, height: number) {
 export function validCropQuad(points: Point[], width: number, height: number) {
   const quad = orderQuad(points)
   if (!quad || width < 2 || height < 2) return false
-  const area = Math.abs(quad.reduce((sum, point, index) => {
-    const next = quad[(index + 1) % quad.length]
-    return sum + point.x * next.y - next.x * point.y
-  }, 0)) / 2
+  const area = polygonArea(quad)
   const edgeLengths = quad.map((point, index) => {
     const next = quad[(index + 1) % quad.length]
     return Math.hypot(next.x - point.x, next.y - point.y)
@@ -230,7 +239,17 @@ export function validCropQuad(points: Point[], width: number, height: number) {
   const inBounds = quad.every(point => point.x >= 0 && point.x <= width && point.y >= 0 && point.y <= height)
   return inBounds && area > width * height * .012 && edgeLengths.every(length => length > Math.min(width, height) * .01)
 }
-function homography(source: Point[], width: number, height: number) { const rows: number[][] = []; const values: number[] = []; const target = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }]; for (let i = 0; i < 4; i++) { const { x, y } = target[i]; const { x: u, y: v } = source[i]; rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u); rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v) } for (let i = 0; i < 8; i++) { let pivot = i; for (let row = i + 1; row < 8; row++) if (Math.abs(rows[row][i]) > Math.abs(rows[pivot][i])) pivot = row; [rows[i], rows[pivot]] = [rows[pivot], rows[i]]; [values[i], values[pivot]] = [values[pivot], values[i]]; const divisor = rows[i][i] || 1; for (let col = i; col < 8; col++) rows[i][col] /= divisor; values[i] /= divisor; for (let row = 0; row < 8; row++) if (row !== i) { const factor = rows[row][i]; for (let col = i; col < 8; col++) rows[row][col] -= factor * rows[i][col]; values[row] -= factor * values[i] } } return [...values, 1] }
+function homography(source: Point[], width: number, height: number) { const rows: number[][] = []; const values: number[] = []; const target = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }]; for (let i = 0; i < 4; i++) { const { x, y } = target[i]; const { x: u, y: v } = source[i]; rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u); rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v) } for (let i = 0; i < 8; i++) { let pivot = i; for (let row = i + 1; row < 8; row++) if (Math.abs(rows[row][i]) > Math.abs(rows[pivot][i])) pivot = row; [rows[i], rows[pivot]] = [rows[pivot], rows[i]]; [values[i], values[pivot]] = [values[pivot], values[i]]; const divisor = rows[i][i]; if (!Number.isFinite(divisor) || Math.abs(divisor) < 1e-9) return undefined; for (let col = i; col < 8; col++) rows[i][col] /= divisor; values[i] /= divisor; for (let row = 0; row < 8; row++) if (row !== i) { const factor = rows[row][i]; for (let col = i; col < 8; col++) rows[row][col] -= factor * rows[i][col]; values[row] -= factor * values[i] } } return values.every(Number.isFinite) ? [...values, 1] : undefined }
+
+const MAX_CROP_EDGE = 4096
+const MAX_CROP_PIXELS = 12_000_000
+
+/** Bound allocations on very large imported camera images while preserving the crop ratio. */
+export function cappedCropSize(width: number, height: number) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined
+  const scale = Math.min(1, MAX_CROP_EDGE / Math.max(width, height), Math.sqrt(MAX_CROP_PIXELS / (width * height)))
+  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) }
+}
 export async function perspectiveCrop(file: Blob, corners: Point[]) {
   const bitmap = await createImageBitmap(file)
   const quad = orderQuad(corners)
@@ -248,9 +267,11 @@ export async function perspectiveCrop(file: Blob, corners: Point[]) {
   const bottomWidth = Math.hypot(quad[2].x - quad[3].x, quad[2].y - quad[3].y)
   const leftHeight = Math.hypot(quad[3].x - quad[0].x, quad[3].y - quad[0].y)
   const rightHeight = Math.hypot(quad[2].x - quad[1].x, quad[2].y - quad[1].y)
-  const outputWidth = Math.max(1, Math.round(Math.max(topWidth, bottomWidth)))
-  const outputHeight = Math.max(1, Math.round(Math.max(leftHeight, rightHeight)))
+  const outputSize = cappedCropSize(Math.max(topWidth, bottomWidth), Math.max(leftHeight, rightHeight))
+  if (!outputSize) { bitmap.close(); return file }
+  const { width: outputWidth, height: outputHeight } = outputSize
   const h = homography(quad, outputWidth, outputHeight)
+  if (!h) { bitmap.close(); return file }
   const output = new ImageData(outputWidth, outputHeight)
   for (let y = 0; y < outputHeight; y++) for (let x = 0; x < outputWidth; x++) {
     const denominator = h[6] * x + h[7] * y + 1

@@ -10,10 +10,12 @@ export default defineConfig({
     tailwindcss(),
     VitePWA({
       registerType: 'prompt',
+      includeAssets: ['favicon.svg', 'icons.svg'],
       manifest: {
         name: 'LocalScan', short_name: 'LocalScan', display: 'standalone',
         start_url: '/', theme_color: '#173b3a', background_color: '#f4f5f2',
-        description: 'Private, local-first document scanning.'
+        description: 'Private, local-first document scanning.',
+        icons: [{ src: '/favicon.svg', sizes: 'any', type: 'image/svg+xml', purpose: 'any maskable' }]
       },
       workbox: { navigateFallback: '/index.html', globPatterns: ['**/*.{js,css,html,svg,png,ico}'] }
     })
