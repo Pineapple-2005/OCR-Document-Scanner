@@ -6,8 +6,96 @@ export async function processImage(file: Blob, filter: Filter, rotation: number)
   bitmap.close(); return new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('Image encoding failed')),'image/jpeg',.94))
 }
 export async function imageDimensions(file:Blob){const b=await createImageBitmap(file);const r={width:b.width,height:b.height};b.close();return r}
-type Point = { x: number; y: number }
+export type Point = { x: number; y: number }
+export type Quad = [Point, Point, Point, Point]
+
+/** Return corners in the only order accepted by the homography: TL, TR, BR, BL. */
+export function orderQuad(points: Point[]): Quad | undefined {
+  if (points.length !== 4 || points.some(point => !Number.isFinite(point.x) || !Number.isFinite(point.y))) return undefined
+  let tl = points[0]
+  let tr = points[0]
+  let br = points[0]
+  let bl = points[0]
+  let minSum = Infinity
+  let maxSum = -Infinity
+  let minDiff = Infinity
+  let maxDiff = -Infinity
+  for (const point of points) {
+    const sum = point.x + point.y
+    const diff = point.x - point.y
+    if (sum < minSum) { minSum = sum; tl = point }
+    if (sum > maxSum) { maxSum = sum; br = point }
+    if (diff > maxDiff) { maxDiff = diff; tr = point }
+    if (diff < minDiff) { minDiff = diff; bl = point }
+  }
+  const quad: Quad = [tl, tr, br, bl]
+  const area = Math.abs(quad.reduce((sum, point, index) => {
+    const next = quad[(index + 1) % quad.length]
+    return sum + point.x * next.y - next.x * point.y
+  }, 0)) / 2
+  return area > 4 ? quad : undefined
+}
+
+/** Reject noisy/default detector output before attempting a destructive crop. */
+export function validQuad(points: Point[], width: number, height: number) {
+  const quad = orderQuad(points)
+  if (!quad || width < 2 || height < 2) return false
+  const area = Math.abs(quad.reduce((sum, point, index) => {
+    const next = quad[(index + 1) % quad.length]
+    return sum + point.x * next.y - next.x * point.y
+  }, 0)) / 2
+  const edgeLengths = quad.map((point, index) => {
+    const next = quad[(index + 1) % quad.length]
+    return Math.hypot(next.x - point.x, next.y - point.y)
+  })
+  return area > width * height * .08 && edgeLengths.every(length => length > Math.min(width, height) * .04)
+}
 function homography(source: Point[], width: number, height: number) { const rows: number[][] = []; const values: number[] = []; const target = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }]; for (let i = 0; i < 4; i++) { const { x, y } = target[i]; const { x: u, y: v } = source[i]; rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u); rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v) } for (let i = 0; i < 8; i++) { let pivot = i; for (let row = i + 1; row < 8; row++) if (Math.abs(rows[row][i]) > Math.abs(rows[pivot][i])) pivot = row; [rows[i], rows[pivot]] = [rows[pivot], rows[i]]; [values[i], values[pivot]] = [values[pivot], values[i]]; const divisor = rows[i][i] || 1; for (let col = i; col < 8; col++) rows[i][col] /= divisor; values[i] /= divisor; for (let row = 0; row < 8; row++) if (row !== i) { const factor = rows[row][i]; for (let col = i; col < 8; col++) rows[row][col] -= factor * rows[i][col]; values[row] -= factor * values[i] } } return [...values, 1] }
-export async function perspectiveCrop(file: Blob, corners: Point[]) { const bitmap = await createImageBitmap(file); const sourceCanvas = document.createElement('canvas'); sourceCanvas.width = bitmap.width; sourceCanvas.height = bitmap.height; const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true })!; sourceContext.drawImage(bitmap, 0, 0); const source = sourceContext.getImageData(0, 0, bitmap.width, bitmap.height); const topWidth = Math.hypot(corners[1].x - corners[0].x, corners[1].y - corners[0].y); const bottomWidth = Math.hypot(corners[2].x - corners[3].x, corners[2].y - corners[3].y); const leftHeight = Math.hypot(corners[3].x - corners[0].x, corners[3].y - corners[0].y); const rightHeight = Math.hypot(corners[2].x - corners[1].x, corners[2].y - corners[1].y); const width = Math.max(1, Math.round(Math.max(topWidth, bottomWidth))); const height = Math.max(1, Math.round(Math.max(leftHeight, rightHeight))); const h = homography(corners, width, height); const output = new ImageData(width, height); for (let y = 0; y < height; y++) for (let x = 0; x < width; x++) { const denominator = h[6] * x + h[7] * y + 1; const sourceX = Math.max(0, Math.min(bitmap.width - 1, Math.round((h[0] * x + h[1] * y + h[2]) / denominator))); const sourceY = Math.max(0, Math.min(bitmap.height - 1, Math.round((h[3] * x + h[4] * y + h[5]) / denominator))); const from = (sourceY * bitmap.width + sourceX) * 4; const to = (y * width + x) * 4; output.data[to] = source.data[from]; output.data[to + 1] = source.data[from + 1]; output.data[to + 2] = source.data[from + 2]; output.data[to + 3] = 255 } const canvas = document.createElement('canvas'); canvas.width = width; canvas.height = height; canvas.getContext('2d')!.putImageData(output, 0, 0); bitmap.close(); return new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('Perspective correction failed')), 'image/jpeg', .95)) }
+export async function perspectiveCrop(file: Blob, corners: Point[]) {
+  const bitmap = await createImageBitmap(file)
+  const quad = orderQuad(corners)
+  if (!quad || !validQuad(quad, bitmap.width, bitmap.height)) {
+    bitmap.close()
+    return file
+  }
+  const sourceCanvas = document.createElement('canvas')
+  sourceCanvas.width = bitmap.width
+  sourceCanvas.height = bitmap.height
+  const sourceContext = sourceCanvas.getContext('2d', { willReadFrequently: true })!
+  sourceContext.drawImage(bitmap, 0, 0)
+  const source = sourceContext.getImageData(0, 0, bitmap.width, bitmap.height)
+  const topWidth = Math.hypot(quad[1].x - quad[0].x, quad[1].y - quad[0].y)
+  const bottomWidth = Math.hypot(quad[2].x - quad[3].x, quad[2].y - quad[3].y)
+  const leftHeight = Math.hypot(quad[3].x - quad[0].x, quad[3].y - quad[0].y)
+  const rightHeight = Math.hypot(quad[2].x - quad[1].x, quad[2].y - quad[1].y)
+  const outputWidth = Math.max(1, Math.round(Math.max(topWidth, bottomWidth)))
+  const outputHeight = Math.max(1, Math.round(Math.max(leftHeight, rightHeight)))
+  const h = homography(quad, outputWidth, outputHeight)
+  const output = new ImageData(outputWidth, outputHeight)
+  for (let y = 0; y < outputHeight; y++) for (let x = 0; x < outputWidth; x++) {
+    const denominator = h[6] * x + h[7] * y + 1
+    const sourceX = clamp((h[0] * x + h[1] * y + h[2]) / denominator, 0, bitmap.width - 1)
+    const sourceY = clamp((h[3] * x + h[4] * y + h[5]) / denominator, 0, bitmap.height - 1)
+    // Bilinear sampling prevents jagged text at the document edges while
+    // retaining a dependency-free local cropper.
+    const x0 = Math.floor(sourceX); const y0 = Math.floor(sourceY)
+    const x1 = Math.min(bitmap.width - 1, x0 + 1); const y1 = Math.min(bitmap.height - 1, y0 + 1)
+    const fx = sourceX - x0; const fy = sourceY - y0
+    const to = (y * outputWidth + x) * 4
+    for (let channel = 0; channel < 3; channel++) {
+      const top = source.data[(y0 * bitmap.width + x0) * 4 + channel] * (1 - fx) + source.data[(y0 * bitmap.width + x1) * 4 + channel] * fx
+      const bottom = source.data[(y1 * bitmap.width + x0) * 4 + channel] * (1 - fx) + source.data[(y1 * bitmap.width + x1) * 4 + channel] * fx
+      output.data[to + channel] = top * (1 - fy) + bottom * fy
+    }
+    output.data[to + 3] = 255
+  }
+  const canvas = document.createElement('canvas')
+  canvas.width = outputWidth
+  canvas.height = outputHeight
+  canvas.getContext('2d')!.putImageData(output, 0, 0)
+  bitmap.close()
+  return new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('Perspective correction failed')), 'image/jpeg', .95))
+}
+function clamp(value: number, min: number, max: number) { return Math.max(min, Math.min(max, value)) }
 export async function cropImage(file: Blob, inset = .08) { const image = await createImageBitmap(file); const left = Math.round(image.width * inset); const top = Math.round(image.height * inset); const canvas = document.createElement('canvas'); canvas.width = image.width - left * 2; canvas.height = image.height - top * 2; canvas.getContext('2d')!.drawImage(image, left, top, canvas.width, canvas.height, 0, 0, canvas.width, canvas.height); image.close(); return new Promise<Blob>((resolve, reject) => canvas.toBlob(value => value ? resolve(value) : reject(new Error('Crop failed')), 'image/jpeg', .95)) }
 export function download(blob:Blob,name:string){const a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
