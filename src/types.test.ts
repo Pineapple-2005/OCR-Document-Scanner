@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DocumentSchema, PageSchema } from './types'
+import { validCropQuad } from './services/image'
 
 describe('LocalScan manifest validation', () => {
   it('accepts a persisted document and page', () => {
@@ -10,5 +11,13 @@ describe('LocalScan manifest validation', () => {
 
   it('rejects a page with an invalid rotation', () => {
     expect(() => PageSchema.parse({ id: 'page-1', documentId: 'doc-1', order: 0, createdAt: '2025-01-01', updatedAt: '2025-01-01', originalPath: 'original', source: 'camera', width: 1200, height: 1600, mimeType: 'image/jpeg', rotation: 45, filter: 'document', processingStatus: 'ready', ocrStatus: 'not-requested', ocrLanguageCodes: [] })).toThrow()
+  })
+
+  it('accepts a rotated perspective crop inside an image', () => {
+    expect(validCropQuad([{ x: 120, y: 80 }, { x: 1080, y: 120 }, { x: 1110, y: 1500 }, { x: 90, y: 1460 }], 1200, 1600)).toBe(true)
+  })
+
+  it('rejects a self-intersecting or out-of-bounds crop', () => {
+    expect(validCropQuad([{ x: -2, y: 10 }, { x: 1100, y: 10 }, { x: 20, y: 1000 }, { x: 1000, y: 900 }], 1200, 1200)).toBe(false)
   })
 })

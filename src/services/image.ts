@@ -50,11 +50,30 @@ export function validQuad(points: Point[], width: number, height: number) {
   })
   return area > width * height * .08 && edgeLengths.every(length => length > Math.min(width, height) * .04)
 }
+/**
+ * Validation for a user-edited crop. Manual crops are allowed to be tighter
+ * than the camera detector's safety threshold, but still must be a real,
+ * non-degenerate quadrilateral inside the source image.
+ */
+export function validCropQuad(points: Point[], width: number, height: number) {
+  const quad = orderQuad(points)
+  if (!quad || width < 2 || height < 2) return false
+  const area = Math.abs(quad.reduce((sum, point, index) => {
+    const next = quad[(index + 1) % quad.length]
+    return sum + point.x * next.y - next.x * point.y
+  }, 0)) / 2
+  const edgeLengths = quad.map((point, index) => {
+    const next = quad[(index + 1) % quad.length]
+    return Math.hypot(next.x - point.x, next.y - point.y)
+  })
+  const inBounds = quad.every(point => point.x >= 0 && point.x <= width && point.y >= 0 && point.y <= height)
+  return inBounds && area > width * height * .012 && edgeLengths.every(length => length > Math.min(width, height) * .01)
+}
 function homography(source: Point[], width: number, height: number) { const rows: number[][] = []; const values: number[] = []; const target = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }]; for (let i = 0; i < 4; i++) { const { x, y } = target[i]; const { x: u, y: v } = source[i]; rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u); rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v) } for (let i = 0; i < 8; i++) { let pivot = i; for (let row = i + 1; row < 8; row++) if (Math.abs(rows[row][i]) > Math.abs(rows[pivot][i])) pivot = row; [rows[i], rows[pivot]] = [rows[pivot], rows[i]]; [values[i], values[pivot]] = [values[pivot], values[i]]; const divisor = rows[i][i] || 1; for (let col = i; col < 8; col++) rows[i][col] /= divisor; values[i] /= divisor; for (let row = 0; row < 8; row++) if (row !== i) { const factor = rows[row][i]; for (let col = i; col < 8; col++) rows[row][col] -= factor * rows[i][col]; values[row] -= factor * values[i] } } return [...values, 1] }
 export async function perspectiveCrop(file: Blob, corners: Point[]) {
   const bitmap = await createImageBitmap(file)
   const quad = orderQuad(corners)
-  if (!quad || !validQuad(quad, bitmap.width, bitmap.height)) {
+  if (!quad || !validCropQuad(quad, bitmap.width, bitmap.height)) {
     bitmap.close()
     return file
   }

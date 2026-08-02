@@ -92,6 +92,14 @@ a { color: inherit; }
 .page-thumb small { text-transform: capitalize; font-size: 10px; }
 .canvas { min-width: 0; display: grid; place-items: center; overflow: auto; padding: 40px; background: #e5ebe6; }
 .document-image { max-width: min(100%, 740px); max-height: calc(100dvh - 214px); background: #fff; box-shadow: 0 22px 48px rgba(20, 43, 36, .16); transition: transform .2s ease; }
+.crop-editor { width: min(100%, 780px); display: grid; gap: 12px; }
+.crop-editor-stage { position: relative; width: 100%; line-height: 0; touch-action: none; }
+.crop-editor-stage > img { display: block; width: 100%; max-height: calc(100dvh - 280px); object-fit: contain; background: #fff; box-shadow: 0 22px 48px rgba(20, 43, 36, .16); }
+.crop-overlay { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
+.crop-overlay polygon { fill: rgba(236, 154, 74, .14); stroke: #c8652b; stroke-width: .8; vector-effect: non-scaling-stroke; }
+.crop-handle { position: absolute; width: 24px; height: 24px; padding: 0; transform: translate(-50%, -50%); border: 3px solid #fff; border-radius: 50%; background: #dc7532; box-shadow: 0 2px 12px rgba(0, 0, 0, .35); touch-action: none; }
+.crop-editor-actions { display: flex; justify-content: flex-end; gap: 10px; }
+.crop-error { margin: 0; color: #a44734; font-size: 13px; }
 .inspector { padding: 22px; border-left: 1px solid #d7dfd9; background: #fafbf8; }
 .inspector h2 { margin: 0 0 17px; color: #174340; font-size: 16px; }
 .filter-list { display: grid; gap: 5px; margin-bottom: 22px; }
