@@ -1,5 +1,5 @@
 import { useEffect, useRef, useState } from 'react'
-import { Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom'
+import { Link, Navigate, Route, Routes, useLocation, useNavigate, useParams, useSearchParams } from 'react-router-dom'
 import { Camera, Check, ChevronLeft, Crop, Download, FileText, Flashlight, FlashlightOff, FolderOpen, ImagePlus, LoaderCircle, MoreHorizontal, Printer, RotateCw, ScanLine, Settings, ShieldCheck, Trash2, Type, X } from 'lucide-react'
 import type { Filter, LibraryItem, Page, ScanDocument } from './types'
 import { storage } from './services/storage'
@@ -18,6 +18,7 @@ function useLibrary(){const [items,setItems]=useState<LibraryItem[]>([]);const [
 function Library(){const {items,loading,refresh}=useLibrary();const nav=useNavigate();const remove=async(id:string)=>{if(confirm('Delete this local document permanently?')){await storage.remove(id);await refresh()}};return <Shell><main className="library"><section className="library-head"><div><p className="kicker">On this device only</p><h1>Your document library</h1><p>Capture, edit, export, and print without an account or upload.</p></div><Link className="primary" to="/scan"><ScanLine size={19}/> Scan document</Link></section>{loading?<p className="loading"><LoaderCircle/> Loading local documents</p>:items.length===0?<section className="empty"><ScanLine size={42}/><h2>Start with a scan or an image</h2><p>Documents remain in browser-managed local storage. Export important copies for backup.</p><Link className="primary" to="/scan">Open scanner</Link></section>:<section className="doc-grid">{items.map(({document,pages})=><article className="doc-card" key={document.id}><button className="doc-open" onClick={()=>nav(`/document/${document.id}`)}><div className="paper-stack"><span>{pages.length}</span><FileText size={38}/></div><h2>{document.title}</h2><p>{pages.length} page{pages.length===1?'':'s'} - updated {new Date(document.updatedAt).toLocaleDateString()}</p></button><button className="icon danger" onClick={()=>void remove(document.id)} aria-label={`Delete ${document.title}`}><Trash2 size={18}/></button></article>)}</section>}</main></Shell>}
 function Scan(){
   const nav=useNavigate();
+  const location=useLocation();
   const [params]=useSearchParams();
   const existingId=params.get('documentId');
   const video=useRef<HTMLVideoElement>(null);
@@ -30,8 +31,12 @@ function Scan(){
   const [torchOn,setTorchOn]=useState(false);
   const [guidePoints,setGuidePoints]=useState('9,12 91,12 91,88 9,88');
   const latestDetection=useRef<Detection | undefined>(undefined);
+  const stopCameraRef=useRef<()=>void>(()=>undefined);
+  const sessionRef=useRef(0);
 
   const stopCamera=()=>{
+    // Invalidate pending camera/capture work before releasing the stream.
+    sessionRef.current+=1;
     stream?.getTracks().forEach(track=>track.stop());
     if(video.current) video.current.srcObject=null;
     setStream(undefined);
@@ -41,21 +46,44 @@ function Scan(){
     setTorchOn(false);
     setTorchSupported(false);
   };
+  stopCameraRef.current=stopCamera;
+  // A scanner route is always a new capture session. Reset transient state when
+  // the route is entered again, but leave saved documents in the local library.
+  useEffect(()=>{
+    // Invalidate an in-flight permission request before stopping the old
+    // stream. A prompt can resolve after navigation; never attach that stale
+    // stream to the newly opened scanner.
+    sessionRef.current+=1;
+    stopCameraRef.current();
+    setError('');
+    setBusy(false);
+    setDetection(undefined);
+    latestDetection.current=undefined;
+    if(input.current)input.current.value='';
+    return()=>{
+      // Leaving the route also invalidates pending permission requests and
+      // releases any stream that is still attached to this session.
+      sessionRef.current+=1;
+      stopCameraRef.current();
+    };
+  },[location.key]);
   useEffect(()=>()=>stream?.getTracks().forEach(track=>track.stop()),[stream]);
   const start=async()=>{
+    const session=sessionRef.current;
     setError('');
     try{
       if(!navigator.mediaDevices?.getUserMedia){setError('This browser does not support camera access. Import an image instead.');return}
       let next:MediaStream;
       try{next=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:24,max:30}}})}
-      catch{next=await navigator.mediaDevices.getUserMedia({audio:false,video:true})}
+      catch{if(session!==sessionRef.current)return; next=await navigator.mediaDevices.getUserMedia({audio:false,video:true})}
+      if(session!==sessionRef.current){next.getTracks().forEach(track=>track.stop());return}
       const track=next.getVideoTracks()[0];
       const capabilities=track?.getCapabilities?.() as MediaTrackCapabilities & {torch?:boolean}|undefined;
       setTorchSupported(Boolean(capabilities?.torch));
       setTorchOn(false);
       setStream(next);
       latestDetection.current=undefined;
-    }catch{setError('Camera access was not granted. You can still import images from your device.')}
+    }catch{if(session===sessionRef.current)setError('Camera access was not granted. You can still import images from your device.')}
   };
   const toggleTorch=async()=>{
     const track=stream?.getVideoTracks()[0];
@@ -68,11 +96,14 @@ function Scan(){
   };
   useEffect(()=>{if(stream&&video.current){video.current.srcObject=stream;void video.current.play().catch(()=>undefined)}},[stream]);
 
-  const save=async(blob:Blob,source:'camera'|'image-import',found?:Detection)=>{
+  const save=async(blob:Blob,source:'camera'|'image-import',found?:Detection,expectedSession=sessionRef.current)=>{
+    const isCurrent=()=>expectedSession===sessionRef.current;
+    if(!isCurrent())return;
     setBusy(true);
     try{
-      const dims=await imageDimensions(blob); const created=now();
+      const dims=await imageDimensions(blob); if(!isCurrent())return; const created=now();
       const existing=existingId?(await storage.list()).find(item=>item.document.id===existingId):undefined;
+      if(!isCurrent())return;
       const id=existing?.document.id??uid(), pageId=uid();
       const rawQuad=found?.corners;
       // Detector coordinates are from the 480px analysis frame. Map them to
@@ -82,13 +113,14 @@ function Scan(){
       const cropQuad=normalizedQuad&&found&&found.confidence>=.35&&validQuad(normalizedQuad,dims.width,dims.height)?normalizedQuad:undefined;
       const doc:ScanDocument=existing?{...existing.document,updatedAt:created,pageIds:[...existing.document.pageIds,pageId]}:{id,title:`Scan ${new Date().toLocaleDateString()}`,createdAt:created,updatedAt:created,pageIds:[pageId],favorite:false,tags:[],ocrStatus:'none',defaultPageSize:'a4',lastOpenedAt:created};
       const corrected=cropQuad?await perspectiveCrop(blob,cropQuad):blob;
+      if(!isCurrent())return;
       const outputDims=await imageDimensions(corrected);
       // The edge-corrected image is the original scan the user should review.
       // Filters are opt-in from the workspace; never make a new capture look
       // monotone before the user has chosen an enhancement.
       const page:Page={id:pageId,documentId:id,order:existing?.pages.length??0,createdAt:created,updatedAt:now(),originalPath:'original',processedPath:'processed',source,width:outputDims.width,height:outputDims.height,mimeType:corrected.type||blob.type||'image/jpeg',rotation:0,filter:'original',processingStatus:'ready',ocrStatus:'not-requested',ocrLanguageCodes:['eng'],cropQuad};
-      await storage.saveDocument(doc); await storage.savePage(page,corrected,corrected); nav(`/document/${id}`);
-    }catch(e){setError(e instanceof Error?e.message:'Could not save this page.')}finally{setBusy(false)}
+      await storage.saveDocument(doc); if(!isCurrent())return; await storage.savePage(page,corrected,corrected); if(isCurrent())nav(`/document/${id}`);
+    }catch(e){if(isCurrent())setError(e instanceof Error?e.message:'Could not save this page.')}finally{if(isCurrent())setBusy(false)}
   };
   const capture=async()=>{
     const current=video.current;
@@ -97,7 +129,8 @@ function Scan(){
     const context=canvas.getContext('2d'); if(!context)return;
     context.drawImage(current,0,0,canvas.width,canvas.height);
     const snapshot=latestDetection.current??detection;
-    canvas.toBlob(blob=>{if(blob)void save(blob,'camera',snapshot)},'image/jpeg',.96);
+    const captureSession=sessionRef.current;
+    canvas.toBlob(blob=>{if(blob)void save(blob,'camera',snapshot,captureSession)},'image/jpeg',.96);
   };
   useEffect(()=>{
     if(!stream||!video.current)return;
