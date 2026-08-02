@@ -239,7 +239,53 @@ export function validCropQuad(points: Point[], width: number, height: number) {
   const inBounds = quad.every(point => point.x >= 0 && point.x <= width && point.y >= 0 && point.y <= height)
   return inBounds && area > width * height * .012 && edgeLengths.every(length => length > Math.min(width, height) * .01)
 }
-function homography(source: Point[], width: number, height: number) { const rows: number[][] = []; const values: number[] = []; const target = [{ x: 0, y: 0 }, { x: width, y: 0 }, { x: width, y: height }, { x: 0, y: height }]; for (let i = 0; i < 4; i++) { const { x, y } = target[i]; const { x: u, y: v } = source[i]; rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y]); values.push(u); rows.push([0, 0, 0, x, y, 1, -v * x, -v * y]); values.push(v) } for (let i = 0; i < 8; i++) { let pivot = i; for (let row = i + 1; row < 8; row++) if (Math.abs(rows[row][i]) > Math.abs(rows[pivot][i])) pivot = row; [rows[i], rows[pivot]] = [rows[pivot], rows[i]]; [values[i], values[pivot]] = [values[pivot], values[i]]; const divisor = rows[i][i]; if (!Number.isFinite(divisor) || Math.abs(divisor) < 1e-9) return undefined; for (let col = i; col < 8; col++) rows[i][col] /= divisor; values[i] /= divisor; for (let row = 0; row < 8; row++) if (row !== i) { const factor = rows[row][i]; for (let col = i; col < 8; col++) rows[row][col] -= factor * rows[i][col]; values[row] -= factor * values[i] } } return values.every(Number.isFinite) ? [...values, 1] : undefined }
+/**
+ * Create a transform from output-canvas coordinates back to the source quad.
+ *
+ * The output's last drawable pixel is width - 1 / height - 1. The earlier
+ * width/height targets left a one-pixel strip inside the right and bottom
+ * frame edges, which is especially visible after a tight camera crop.
+ */
+export function perspectiveTransform(source: Quad, width: number, height: number) {
+  if (width < 2 || height < 2) return undefined
+  const rows: number[][] = []
+  const values: number[] = []
+  const target = [{ x: 0, y: 0 }, { x: width - 1, y: 0 }, { x: width - 1, y: height - 1 }, { x: 0, y: height - 1 }]
+  for (let index = 0; index < 4; index++) {
+    const { x, y } = target[index]
+    const { x: u, y: v } = source[index]
+    rows.push([x, y, 1, 0, 0, 0, -u * x, -u * y])
+    values.push(u)
+    rows.push([0, 0, 0, x, y, 1, -v * x, -v * y])
+    values.push(v)
+  }
+  for (let column = 0; column < 8; column++) {
+    let pivot = column
+    for (let row = column + 1; row < 8; row++) if (Math.abs(rows[row][column]) > Math.abs(rows[pivot][column])) pivot = row
+    ;[rows[column], rows[pivot]] = [rows[pivot], rows[column]]
+    ;[values[column], values[pivot]] = [values[pivot], values[column]]
+    const divisor = rows[column][column]
+    if (!Number.isFinite(divisor) || Math.abs(divisor) < 1e-9) return undefined
+    for (let cell = column; cell < 8; cell++) rows[column][cell] /= divisor
+    values[column] /= divisor
+    for (let row = 0; row < 8; row++) {
+      if (row === column) continue
+      const factor = rows[row][column]
+      for (let cell = column; cell < 8; cell++) rows[row][cell] -= factor * rows[column][cell]
+      values[row] -= factor * values[column]
+    }
+  }
+  return values.every(Number.isFinite) ? [...values, 1] : undefined
+}
+
+/** Map an output pixel through a perspective transform to its source pixel. */
+export function mapPerspectivePoint(transform: number[], x: number, y: number): Point | undefined {
+  const denominator = transform[6] * x + transform[7] * y + 1
+  if (!Number.isFinite(denominator) || Math.abs(denominator) < 1e-9) return undefined
+  const sourceX = (transform[0] * x + transform[1] * y + transform[2]) / denominator
+  const sourceY = (transform[3] * x + transform[4] * y + transform[5]) / denominator
+  return Number.isFinite(sourceX) && Number.isFinite(sourceY) ? { x: sourceX, y: sourceY } : undefined
+}
 
 const MAX_CROP_EDGE = 4096
 const MAX_CROP_PIXELS = 12_000_000
@@ -248,7 +294,7 @@ const MAX_CROP_PIXELS = 12_000_000
 export function cappedCropSize(width: number, height: number) {
   if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return undefined
   const scale = Math.min(1, MAX_CROP_EDGE / Math.max(width, height), Math.sqrt(MAX_CROP_PIXELS / (width * height)))
-  return { width: Math.max(1, Math.round(width * scale)), height: Math.max(1, Math.round(height * scale)) }
+  return { width: Math.max(2, Math.floor(width * scale)), height: Math.max(2, Math.floor(height * scale)) }
 }
 export async function perspectiveCrop(file: Blob, corners: Point[]) {
   const bitmap = await createImageBitmap(file)
@@ -270,13 +316,17 @@ export async function perspectiveCrop(file: Blob, corners: Point[]) {
   const outputSize = cappedCropSize(Math.max(topWidth, bottomWidth), Math.max(leftHeight, rightHeight))
   if (!outputSize) { bitmap.close(); return file }
   const { width: outputWidth, height: outputHeight } = outputSize
-  const h = homography(quad, outputWidth, outputHeight)
+  const h = perspectiveTransform(quad, outputWidth, outputHeight)
   if (!h) { bitmap.close(); return file }
+  const samplePoints = [{ x: 0, y: 0 }, { x: outputWidth - 1, y: 0 }, { x: outputWidth - 1, y: outputHeight - 1 }, { x: 0, y: outputHeight - 1 }, { x: (outputWidth - 1) / 2, y: (outputHeight - 1) / 2 }]
+  if (samplePoints.some(point => !mapPerspectivePoint(h, point.x, point.y))) { bitmap.close(); return file }
   const output = new ImageData(outputWidth, outputHeight)
   for (let y = 0; y < outputHeight; y++) for (let x = 0; x < outputWidth; x++) {
-    const denominator = h[6] * x + h[7] * y + 1
-    const sourceX = clamp((h[0] * x + h[1] * y + h[2]) / denominator, 0, bitmap.width - 1)
-    const sourceY = clamp((h[3] * x + h[4] * y + h[5]) / denominator, 0, bitmap.height - 1)
+    const mapped = mapPerspectivePoint(h, x, y)
+    // A convex, validated quad cannot cross its projective horizon. Retain a
+    // safe source pixel if an extreme numerical case still reaches one.
+    const sourceX = clamp(mapped?.x ?? 0, 0, bitmap.width - 1)
+    const sourceY = clamp(mapped?.y ?? 0, 0, bitmap.height - 1)
     // Bilinear sampling prevents jagged text at the document edges while
     // retaining a dependency-free local cropper.
     const x0 = Math.floor(sourceX); const y0 = Math.floor(sourceY)

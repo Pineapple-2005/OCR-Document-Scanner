@@ -14,6 +14,7 @@ const visibleFilters:Filter[]=['original','enhance','monotone','receipt','whiteb
 const canonicalFilter=(filter:Filter):Filter=>filter==='document'?'enhance':filter==='black-white'?'monotone':filter;
 const EMPTY_PAGES: Page[]=[];
 type Detection = { confidence: number; blurScore: number; guidance: 'searching'|'ready'|'move-closer'; corners: Array<{x:number;y:number}>; frameWidth: number; frameHeight: number }
+const isReliableDetection=(value:Detection|undefined)=>Boolean(value&&value.guidance==='ready'&&value.confidence>=.56);
 function UpdatePrompt(){
   const [refresh,setRefresh]=useState<(()=>void)|undefined>();
   useEffect(()=>{
@@ -57,6 +58,10 @@ function Scan(){
   const [torchOn,setTorchOn]=useState(false);
   const [guidePoints,setGuidePoints]=useState('9,12 91,12 91,88 9,88');
   const latestDetection=useRef<Detection | undefined>(undefined);
+  // Keep a stable reference to the viewfinder itself. The crop outline is
+  // mounted only for a reliable frame, but its coordinates must already be
+  // current on the render where it first appears.
+  const viewfinder=useRef<HTMLDivElement>(null);
   const stopCameraRef=useRef<()=>void>(()=>undefined);
   const sessionRef=useRef(0);
 
@@ -137,11 +142,15 @@ function Scan(){
       if(!isCurrent())return;
       const id=existing?.document.id??uid(), pageId=uid();
       const rawQuad=found?.corners;
-      // Detector coordinates are from the 480px analysis frame. Map them to
-      // the actual captured bitmap, then reject default/noisy quads before
-      // applying perspective correction.
-      const normalizedQuad=rawQuad&&found?rawQuad.map(c=>({x:Math.max(0,Math.min(dims.width-1,c.x/Math.max(1,found.frameWidth)*dims.width)),y:Math.max(0,Math.min(dims.height-1,c.y/Math.max(1,found.frameHeight)*dims.height))})):undefined;
-      const cropQuad=normalizedQuad&&found&&found.confidence>=.35&&validQuad(normalizedQuad,dims.width,dims.height)?normalizedQuad:undefined;
+      // The worker receives a resized copy of the raw video frame. Map its
+      // pixel coordinates edge-to-edge into the canvas capture (not into the
+      // fitted DOM video box), so a contain letterbox never shifts the crop.
+      const normalizedQuad=rawQuad&&found?rawQuad.map(c=>({
+        x:Math.max(0,Math.min(dims.width-1,c.x/Math.max(1,found.frameWidth-1)*Math.max(0,dims.width-1))),
+        y:Math.max(0,Math.min(dims.height-1,c.y/Math.max(1,found.frameHeight-1)*Math.max(0,dims.height-1))),
+      })):undefined;
+      // Only use the same stable result the user sees as "Page found".
+      const cropQuad=normalizedQuad&&isReliableDetection(found)&&validQuad(normalizedQuad,dims.width,dims.height)?normalizedQuad:undefined;
       const doc:ScanDocument=existing?{...existing.document,updatedAt:created,pageIds:[...existing.document.pageIds,pageId]}:{id,title:`Scan ${new Date().toLocaleDateString()}`,createdAt:created,updatedAt:created,pageIds:[pageId],favorite:false,tags:[],ocrStatus:'none',defaultPageSize:'a4',lastOpenedAt:created};
       const corrected=cropQuad?await perspectiveCrop(blob,cropQuad):blob;
       if(!isCurrent())return;
@@ -170,11 +179,19 @@ function Scan(){
     if(!context)return()=>worker.terminate();
     let timer=0; let pending=false; let smoothed:Detection|undefined; let analysisWidth=0; let analysisHeight=0;
     const updateGuide=(next:Detection)=>{
-      const host=video.current?.parentElement; const rect=host?.getBoundingClientRect(); const videoRect=video.current?.getBoundingClientRect(); if(!rect||!videoRect)return;
-      const scale=Math.min(videoRect.width/next.frameWidth,videoRect.height/next.frameHeight);
-      const offsetX=(videoRect.left-rect.left)+(videoRect.width-next.frameWidth*scale)/2;
-      const offsetY=(videoRect.top-rect.top)+(videoRect.height-next.frameHeight*scale)/2;
-      setGuidePoints(next.corners.map(c=>`${((offsetX+c.x*scale)/rect.width)*100},${((offsetY+c.y*scale)/rect.height)*100}`).join(' '));
+      const current=video.current; const rect=viewfinder.current?.getBoundingClientRect(); const videoRect=current?.getBoundingClientRect(); if(!current||!rect||!videoRect)return;
+      // `getBoundingClientRect()` is the CSS box, while object-fit: contain
+      // draws the camera inside that box. Resolve the fitted source rectangle
+      // from the *actual* video dimensions before projecting worker pixels.
+      const sourceWidth=current.videoWidth||next.frameWidth; const sourceHeight=current.videoHeight||next.frameHeight;
+      const displayScale=Math.min(videoRect.width/sourceWidth,videoRect.height/sourceHeight);
+      const sourceLeft=videoRect.left+(videoRect.width-sourceWidth*displayScale)/2;
+      const sourceTop=videoRect.top+(videoRect.height-sourceHeight*displayScale)/2;
+      setGuidePoints(next.corners.map(c=>{
+        const sourceX=c.x/Math.max(1,next.frameWidth-1)*Math.max(0,sourceWidth-1);
+        const sourceY=c.y/Math.max(1,next.frameHeight-1)*Math.max(0,sourceHeight-1);
+        return `${((sourceLeft+sourceX*displayScale-rect.left)/rect.width)*100},${((sourceTop+sourceY*displayScale-rect.top)/rect.height)*100}`;
+      }).join(' '));
     };
     const analyze=()=>{
       const current=video.current;
@@ -218,7 +235,7 @@ function Scan(){
     return()=>{window.clearTimeout(timer);document.removeEventListener('visibilitychange',visibility);worker.terminate()};
   },[stream,detectorRevision]);
   const restartDetection=()=>{setError('');setDetectorFailed(false);setDetectorRevision(value=>value+1)};
-  return <main className="scanner"><div className="scanner-top"><Link to="/library" aria-label="Close scanner"><X/></Link><span>Live document detection</span><div className="scanner-top-actions"><button disabled={!stream||!torchSupported} onClick={()=>void toggleTorch()} aria-label={torchOn?'Turn flash off':'Turn flash on'} title={torchSupported?(torchOn?'Turn flash off':'Turn flash on'):'Flash unavailable on this camera'}>{torchOn?<FlashlightOff/>:<Flashlight/>}</button><button disabled={!stream} onClick={stopCamera}>Stop camera</button></div></div><div className="viewfinder">{stream?<video ref={video} playsInline muted aria-label="Live camera view"/>:<div className="camera-intro"><Camera size={46}/><h1>Ready when you are</h1><p>Camera access starts only after you choose it. The outline follows the page; capture stays manual.</p><button className="primary" disabled={cameraStarting} onClick={()=>void start()}>{cameraStarting?<><LoaderCircle className="spin"/> Starting camera...</>:<>Enable camera</>}</button></div>}{stream&&<div className={`crop-guide ${detection?.guidance==='ready'?'stable':''}`} aria-hidden="true"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon points={guidePoints}/></svg></div>}</div><p className="scanner-status" role={error?'alert':'status'}>{error||(!stream?(cameraStarting?'Requesting camera access...':'Enable the camera or import a document to begin.'):!detection?'Analyzing the page locally':detection.guidance==='ready'?'Page found — tap Capture when you are ready.':detection.guidance==='move-closer'?'Move closer so the page fills more of the frame.':'Searching for the four page edges. You can capture manually.')}</p>{detectorFailed&&stream&&<button className="secondary" onClick={restartDetection}>Restart live detection</button>}<div className="scanner-controls"><input ref={input} hidden type="file" accept="image/*" capture="environment" onChange={e=>{const file=e.target.files?.[0];if(file)void save(file,'image-import');e.currentTarget.value=''}}/><button onClick={()=>input.current?.click()} disabled={busy}><ImagePlus/> Import</button><button className="capture" disabled={!stream||busy||cameraStarting} onClick={()=>void capture()} aria-label="Capture document" title="Capture document"><span/></button><button onClick={()=>nav('/library')}><FolderOpen/> Library</button></div></main>
+  return <main className="scanner"><div className="scanner-top"><Link to="/library" aria-label="Close scanner"><X/></Link><span>Live document detection</span><div className="scanner-top-actions"><button disabled={!stream||!torchSupported} onClick={()=>void toggleTorch()} aria-label={torchOn?'Turn flash off':'Turn flash on'} title={torchSupported?(torchOn?'Turn flash off':'Turn flash on'):'Flash unavailable on this camera'}>{torchOn?<FlashlightOff/>:<Flashlight/>}</button><button disabled={!stream} onClick={stopCamera}>Stop camera</button></div></div><div ref={viewfinder} className="viewfinder">{stream?<video ref={video} playsInline muted aria-label="Live camera view"/>:<div className="camera-intro"><Camera size={46}/><h1>Ready when you are</h1><p>Camera access starts only after you choose it. The outline follows the page; capture stays manual.</p><button className="primary" disabled={cameraStarting} onClick={()=>void start()}>{cameraStarting?<><LoaderCircle className="spin"/> Starting camera...</>:<>Enable camera</>}</button></div>}{stream&&isReliableDetection(detection)&&<div className="crop-guide stable" aria-hidden="true"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon points={guidePoints}/></svg></div>}</div><p className="scanner-status" role={error?'alert':'status'}>{error||(!stream?(cameraStarting?'Requesting camera access...':'Enable the camera or import a document to begin.'):!detection?'Analyzing the page locally':isReliableDetection(detection)?'Page found — tap Capture when you are ready.':detection.guidance==='move-closer'?'Move closer so the page fills more of the frame.':'Searching for the four page edges. You can capture manually.')}</p>{detectorFailed&&stream&&<button className="secondary" onClick={restartDetection}>Restart live detection</button>}<div className="scanner-controls"><input ref={input} hidden type="file" accept="image/*" capture="environment" onChange={e=>{const file=e.target.files?.[0];if(file)void save(file,'image-import');e.currentTarget.value=''}}/><button onClick={()=>input.current?.click()} disabled={busy}><ImagePlus/> Import</button><button className="capture" disabled={!stream||busy||cameraStarting} onClick={()=>void capture()} aria-label="Capture document" title="Capture document"><span/></button><button onClick={()=>nav('/library')}><FolderOpen/> Library</button></div></main>
 }
 
 function findDoc(items:LibraryItem[],id:string){return items.find(x=>x.document.id===id)}

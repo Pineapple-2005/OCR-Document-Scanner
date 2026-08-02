@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { DocumentSchema, PageSchema, type Page, type ScanDocument } from './types'
-import { cappedCropSize, orderQuad, validCropQuad } from './services/image'
+import { cappedCropSize, mapPerspectivePoint, orderQuad, perspectiveTransform, validCropQuad } from './services/image'
 import { pageSizeFor } from './services/export'
 import { orderedDocumentPages } from './services/storage'
 
@@ -28,6 +28,25 @@ describe('LocalScan manifest validation', () => {
       { x: 120, y: 80 }, { x: 980, y: 100 }, { x: 1000, y: 900 }, { x: 80, y: 900 },
     ])
     expect(orderQuad([{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 40, y: 30 }, { x: 0, y: 100 }])).toBeUndefined()
+  })
+
+  it('maps every output edge to the detected camera frame, including rotated quads', () => {
+    const cameraQuad = orderQuad([
+      { x: 735, y: 215 }, { x: 1010, y: 1010 }, { x: 175, y: 875 }, { x: 380, y: 110 },
+    ])
+    expect(cameraQuad).toBeDefined()
+    const transform = perspectiveTransform(cameraQuad!, 840, 1120)
+    expect(transform).toBeDefined()
+    const mappedCorners = [
+      mapPerspectivePoint(transform!, 0, 0),
+      mapPerspectivePoint(transform!, 839, 0),
+      mapPerspectivePoint(transform!, 839, 1119),
+      mapPerspectivePoint(transform!, 0, 1119),
+    ]
+    mappedCorners.forEach((point, index) => {
+      expect(point!.x).toBeCloseTo(cameraQuad![index].x, 5)
+      expect(point!.y).toBeCloseTo(cameraQuad![index].y, 5)
+    })
   })
 
   it('caps perspective output allocation while preserving its ratio', () => {
