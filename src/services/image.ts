@@ -1,8 +1,169 @@
 import type { Filter } from '../types'
+
+const clampByte = (value: number) => Math.max(0, Math.min(255, Math.round(value)))
+const luminance = (red: number, green: number, blue: number) => .2126 * red + .7152 * green + .0722 * blue
+
+/**
+ * Improve a colour document without turning it into a grey scan.
+ *
+ * The previous implementation applied one fixed contrast value to every
+ * channel. That made dark phone photos stay muddy and clipped highlights on
+ * white paper. A percentile tone map is much more useful for scans: it
+ * adapts to the actual exposure, then applies the same luminance gain to RGB
+ * so ink and paper colour are retained.
+ */
+export function enhancePixels(data: Uint8ClampedArray, width: number, height: number) {
+  const pixelCount = Math.max(0, width * height)
+  if (!pixelCount || data.length < pixelCount * 4) return
+
+  // Build a small luminance histogram. Sampling keeps a large phone frame
+  // responsive while still seeing enough of the page to choose good limits.
+  const histogram = new Uint32Array(256)
+  const sampleStride = Math.max(1, Math.floor(Math.sqrt(pixelCount / 50000)))
+  let samples = 0
+  for (let y = 0; y < height; y += sampleStride) {
+    for (let x = 0; x < width; x += sampleStride) {
+      const index = (y * width + x) * 4
+      histogram[Math.round(luminance(data[index], data[index + 1], data[index + 2]))]++
+      samples++
+    }
+  }
+  if (!samples) return
+
+  const percentile = (fraction: number) => {
+    const target = Math.max(0, Math.min(samples - 1, Math.round((samples - 1) * fraction)))
+    let seen = 0
+    for (let value = 0; value < histogram.length; value++) {
+      seen += histogram[value]
+      if (seen > target) return value
+    }
+    return 255
+  }
+  let black = percentile(.015)
+  let white = percentile(.985)
+  // A mostly-white page (or an evenly exposed blank page) can put both
+  // percentiles at 255. Never map that valid paper white to black. With no
+  // useful dynamic range, retain the source tones and only apply the gentle
+  // gamma lift below instead of inventing contrast from a narrow sample.
+  if (white - black < 48) {
+    black = 0
+    white = 255
+  }
+  white = Math.max(black + 24, white)
+  const range = white - black
+
+  for (let index = 0; index < pixelCount * 4; index += 4) {
+    const red = data[index]
+    const green = data[index + 1]
+    const blue = data[index + 2]
+    const sourceLuma = luminance(red, green, blue)
+    const normalized = Math.max(0, Math.min(1, (sourceLuma - black) / range))
+    // A very gentle gamma lift opens shadows while the percentile stretch
+    // restores paper whites. Keeping this below 1 avoids a washed-out page.
+    const targetLuma = Math.pow(normalized, .93) * 255
+    const gain = Math.max(.5, Math.min(2.25, targetLuma / Math.max(sourceLuma, 12)))
+    data[index] = clampByte(red * gain)
+    data[index + 1] = clampByte(green * gain)
+    data[index + 2] = clampByte(blue * gain)
+  }
+}
+
+type MonotoneField = { width: number; height: number; values: Float32Array }
+
+/** Build a low-resolution adaptive threshold field for page-aware B/W scans. */
+function monotoneThresholdField(gray: Uint8Array, width: number, height: number): MonotoneField {
+  const pixelCount = width * height
+  const tileSize = Math.max(24, Math.min(96, Math.round(Math.sqrt(pixelCount / 4000))))
+  const columns = Math.ceil(width / tileSize)
+  const rows = Math.ceil(height / tileSize)
+  const values = new Float32Array(columns * rows)
+  let globalSum = 0
+  for (let tileY = 0; tileY < rows; tileY++) {
+    const top = tileY * tileSize
+    const bottom = Math.min(height, top + tileSize)
+    for (let tileX = 0; tileX < columns; tileX++) {
+      const left = tileX * tileSize
+      const right = Math.min(width, left + tileSize)
+      let sum = 0
+      let squareSum = 0
+      let count = 0
+      for (let y = top; y < bottom; y++) {
+        const row = y * width
+        for (let x = left; x < right; x++) {
+          const value = gray[row + x]
+          sum += value
+          squareSum += value * value
+          count++
+        }
+      }
+      const mean = sum / Math.max(1, count)
+      const variance = Math.max(0, squareSum / Math.max(1, count) - mean * mean)
+      const standardDeviation = Math.sqrt(variance)
+      // Sauvola-inspired threshold. It follows shadows on the page while
+      // leaving high-contrast ink comfortably below the cut-off.
+      values[tileY * columns + tileX] = Math.max(72, Math.min(224, mean * (1 + .24 * (standardDeviation / 128 - 1))))
+      globalSum += sum
+    }
+  }
+  // Blend every local tile with a small global component to avoid visible
+  // seams where two tiles have very different backgrounds.
+  const globalMean = globalSum / Math.max(1, pixelCount)
+  for (let index = 0; index < values.length; index++) values[index] = values[index] * .78 + globalMean * .22
+  return { width: columns, height: rows, values }
+}
+
+function interpolatedFieldValue(field: MonotoneField, x: number, y: number, tileSize: number) {
+  const column = Math.max(0, Math.min(field.width - 1, x / tileSize - .5))
+  const row = Math.max(0, Math.min(field.height - 1, y / tileSize - .5))
+  const x0 = Math.floor(column)
+  const y0 = Math.floor(row)
+  const x1 = Math.min(field.width - 1, x0 + 1)
+  const y1 = Math.min(field.height - 1, y0 + 1)
+  const fx = column - x0
+  const fy = row - y0
+  const topLeft = field.values[y0 * field.width + x0]
+  const topRight = field.values[y0 * field.width + x1]
+  const bottomLeft = field.values[y1 * field.width + x0]
+  const bottomRight = field.values[y1 * field.width + x1]
+  return topLeft * (1 - fx) * (1 - fy) + topRight * fx * (1 - fy) + bottomLeft * (1 - fx) * fy + bottomRight * fx * fy
+}
+
+/**
+ * Apply an adaptive, soft monochrome conversion.
+ *
+ * Unlike a single global threshold, the threshold follows page shadows and
+ * uneven lighting. A soft transition preserves anti-aliased text edges so
+ * the resulting JPEG remains legible when zoomed or OCR'd.
+ */
+export function monotonePixels(data: Uint8ClampedArray, width: number, height: number) {
+  const pixelCount = Math.max(0, width * height)
+  if (!pixelCount || data.length < pixelCount * 4) return
+  const gray = new Uint8Array(pixelCount)
+  for (let index = 0; index < pixelCount; index++) {
+    const source = index * 4
+    gray[index] = clampByte(luminance(data[source], data[source + 1], data[source + 2]))
+  }
+  const tileSize = Math.max(24, Math.min(96, Math.round(Math.sqrt(pixelCount / 4000))))
+  const field = monotoneThresholdField(gray, width, height)
+  for (let y = 0; y < height; y++) {
+    const row = y * width
+    for (let x = 0; x < width; x++) {
+      const threshold = interpolatedFieldValue(field, x, y, tileSize)
+      // 42 gives a smooth but still decisive ink edge. Keep channels equal
+      // so consumers can reliably identify this as a monochrome page.
+      const value = clampByte((gray[row + x] - threshold) * 5.2 + 128)
+      const target = (row + x) * 4
+      data[target] = value
+      data[target + 1] = value
+      data[target + 2] = value
+    }
+  }
+}
+
 export async function processImage(file: Blob, filter: Filter, rotation: number): Promise<Blob> {
   const bitmap=await createImageBitmap(file); const canvas=document.createElement('canvas'); const turned=rotation===90||rotation===270
   canvas.width=turned?bitmap.height:bitmap.width; canvas.height=turned?bitmap.width:bitmap.height; const c=canvas.getContext('2d')!; c.save(); c.translate(canvas.width/2,canvas.height/2); c.rotate(rotation*Math.PI/180); c.drawImage(bitmap,-bitmap.width/2,-bitmap.height/2); c.restore();
-  if(filter!=='original') { const data=c.getImageData(0,0,canvas.width,canvas.height); const p=data.data; for(let i=0;i<p.length;i+=4){ const l=.2126*p[i]+.7152*p[i+1]+.0722*p[i+2]; if(filter==='monotone'||filter==='black-white'){const v=Math.min(255,Math.max(0,(l-112)*1.65+112));p[i]=p[i+1]=p[i+2]=v}else if(filter==='enhance'||filter==='document'){const contrast=1.18; p[i]=Math.min(255,Math.max(0,(p[i]-128)*contrast+128));p[i+1]=Math.min(255,Math.max(0,(p[i+1]-128)*contrast+128));p[i+2]=Math.min(255,Math.max(0,(p[i+2]-128)*contrast+128))}else if(filter==='receipt'){const v=Math.min(255,Math.max(0,(l-100)*2.35+100));p[i]=p[i+1]=p[i+2]=v}else {p[i]=Math.min(255,p[i]*1.1);p[i+1]=Math.min(255,p[i+1]*1.12);p[i+2]=Math.min(255,p[i+2]*1.05)}} c.putImageData(data,0,0) }
+  if(filter!=='original') { const data=c.getImageData(0,0,canvas.width,canvas.height); const p=data.data; if(filter==='enhance'||filter==='document') enhancePixels(p, canvas.width, canvas.height); else if(filter==='monotone'||filter==='black-white') monotonePixels(p, canvas.width, canvas.height); else for(let i=0;i<p.length;i+=4){ const l=luminance(p[i],p[i+1],p[i+2]); if(filter==='receipt'){const v=Math.min(255,Math.max(0,(l-100)*2.35+100));p[i]=p[i+1]=p[i+2]=v}else {p[i]=Math.min(255,p[i]*1.1);p[i+1]=Math.min(255,p[i+1]*1.12);p[i+2]=Math.min(255,p[i+2]*1.05)}} c.putImageData(data,0,0) }
   bitmap.close(); return new Promise((resolve,reject)=>canvas.toBlob(b=>b?resolve(b):reject(new Error('Image encoding failed')),'image/jpeg',.94))
 }
 export async function imageDimensions(file:Blob){const b=await createImageBitmap(file);const r={width:b.width,height:b.height};b.close();return r}
