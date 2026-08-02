@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { Link, Navigate, Route, Routes, useNavigate, useParams, useSearchParams } from 'react-router-dom'
-import { Camera, ChevronLeft, Download, FileText, FolderOpen, ImagePlus, LoaderCircle, MoreHorizontal, Printer, RotateCw, ScanLine, Settings, ShieldCheck, Trash2, Type, X } from 'lucide-react'
+import { Camera, ChevronLeft, Download, FileText, Flashlight, FlashlightOff, FolderOpen, ImagePlus, LoaderCircle, MoreHorizontal, Printer, RotateCw, ScanLine, Settings, ShieldCheck, Trash2, Type, X } from 'lucide-react'
 import type { Filter, LibraryItem, Page, ScanDocument } from './types'
 import { storage } from './services/storage'
 import { cropImage, imageDimensions, perspectiveCrop, processImage, validQuad } from './services/image'
@@ -9,6 +9,9 @@ import { recognize } from './services/ocr'
 import './index.css'
 
 const now=()=>new Date().toISOString(); const uid=()=>crypto.randomUUID();
+const filterLabel=(filter:Filter)=>({original:'Original',enhance:'Enhance',monotone:'Monotone',document:'Enhance', 'black-white':'Monotone',receipt:'Receipt',whiteboard:'Whiteboard'}[filter]??'Original');
+const visibleFilters:Filter[]=['original','enhance','monotone','receipt','whiteboard'];
+const canonicalFilter=(filter:Filter):Filter=>filter==='document'?'enhance':filter==='black-white'?'monotone':filter;
 type Detection = { confidence: number; blurScore: number; guidance: 'searching'|'ready'|'move-closer'; corners: Array<{x:number;y:number}>; frameWidth: number; frameHeight: number }
 function Shell({children}:{children:React.ReactNode}){return <div className="shell"><header><Link className="brand" to="/library"><span>LS</span> LocalScan</Link><nav><Link to="/library">Library</Link><Link to="/settings"><Settings size={18}/> Settings</Link></nav></header>{children}</div>}
 function useLibrary(){const [items,setItems]=useState<LibraryItem[]>([]);const [loading,setLoading]=useState(true);const refresh=async()=>{setLoading(true);try{setItems(await storage.list())}finally{setLoading(false)}};useEffect(()=>{void refresh()},[]);return{items,loading,refresh}}
@@ -23,6 +26,8 @@ function Scan(){
   const [error,setError]=useState('');
   const [busy,setBusy]=useState(false);
   const [detection,setDetection]=useState<Detection>();
+  const [torchSupported,setTorchSupported]=useState(false);
+  const [torchOn,setTorchOn]=useState(false);
   const [guidePoints,setGuidePoints]=useState('9,12 91,12 91,88 9,88');
   const latestDetection=useRef<Detection | undefined>(undefined);
 
@@ -33,6 +38,8 @@ function Scan(){
     setDetection(undefined);
     latestDetection.current=undefined;
     setGuidePoints('9,12 91,12 91,88 9,88');
+    setTorchOn(false);
+    setTorchSupported(false);
   };
   useEffect(()=>()=>stream?.getTracks().forEach(track=>track.stop()),[stream]);
   const start=async()=>{
@@ -40,11 +47,24 @@ function Scan(){
     try{
       if(!navigator.mediaDevices?.getUserMedia){setError('This browser does not support camera access. Import an image instead.');return}
       let next:MediaStream;
-      try{next=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080}}})}
+      try{next=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:'environment'},width:{ideal:1920},height:{ideal:1080},frameRate:{ideal:24,max:30}}})}
       catch{next=await navigator.mediaDevices.getUserMedia({audio:false,video:true})}
+      const track=next.getVideoTracks()[0];
+      const capabilities=track?.getCapabilities?.() as MediaTrackCapabilities & {torch?:boolean}|undefined;
+      setTorchSupported(Boolean(capabilities?.torch));
+      setTorchOn(false);
       setStream(next);
       latestDetection.current=undefined;
     }catch{setError('Camera access was not granted. You can still import images from your device.')}
+  };
+  const toggleTorch=async()=>{
+    const track=stream?.getVideoTracks()[0];
+    if(!track||!torchSupported)return;
+    const next=!torchOn;
+    try{
+      await track.applyConstraints({advanced:[{torch:next}]} as unknown as MediaTrackConstraints);
+      setTorchOn(next);
+    }catch{setError('This camera does not allow the flash to be changed while scanning.');setTorchSupported(false)}
   };
   useEffect(()=>{if(stream&&video.current){video.current.srcObject=stream;void video.current.play().catch(()=>undefined)}},[stream]);
 
@@ -63,9 +83,11 @@ function Scan(){
       const doc:ScanDocument=existing?{...existing.document,updatedAt:created,pageIds:[...existing.document.pageIds,pageId]}:{id,title:`Scan ${new Date().toLocaleDateString()}`,createdAt:created,updatedAt:created,pageIds:[pageId],favorite:false,tags:[],ocrStatus:'none',defaultPageSize:'a4',lastOpenedAt:created};
       const corrected=cropQuad?await perspectiveCrop(blob,cropQuad):blob;
       const outputDims=await imageDimensions(corrected);
-      const page:Page={id:pageId,documentId:id,order:existing?.pages.length??0,createdAt:created,updatedAt:now(),originalPath:'original',processedPath:'processed',source,width:outputDims.width,height:outputDims.height,mimeType:blob.type||'image/jpeg',rotation:0,filter:'document',processingStatus:'ready',ocrStatus:'not-requested',ocrLanguageCodes:['eng'],cropQuad};
-      const processed=await processImage(corrected,'document',0);
-      await storage.saveDocument(doc); await storage.savePage(page,blob,processed); nav(`/document/${id}`);
+      // The edge-corrected image is the original scan the user should review.
+      // Filters are opt-in from the workspace; never make a new capture look
+      // monotone before the user has chosen an enhancement.
+      const page:Page={id:pageId,documentId:id,order:existing?.pages.length??0,createdAt:created,updatedAt:now(),originalPath:'original',processedPath:'processed',source,width:outputDims.width,height:outputDims.height,mimeType:corrected.type||blob.type||'image/jpeg',rotation:0,filter:'original',processingStatus:'ready',ocrStatus:'not-requested',ocrLanguageCodes:['eng'],cropQuad};
+      await storage.saveDocument(doc); await storage.savePage(page,corrected,corrected); nav(`/document/${id}`);
     }catch(e){setError(e instanceof Error?e.message:'Could not save this page.')}finally{setBusy(false)}
   };
   const capture=async()=>{
@@ -82,7 +104,7 @@ function Scan(){
     const worker=new Worker(new URL('./workers/cv.worker.ts',import.meta.url),{type:'module'});
     const canvas=document.createElement('canvas'); const context=canvas.getContext('2d',{willReadFrequently:true});
     if(!context)return()=>worker.terminate();
-    let timer=0; let pending=false; let smoothed:Detection|undefined;
+    let timer=0; let pending=false; let smoothed:Detection|undefined; let analysisWidth=0; let analysisHeight=0;
     const updateGuide=(next:Detection)=>{
       const host=video.current?.parentElement; const rect=host?.getBoundingClientRect(); const videoRect=video.current?.getBoundingClientRect(); if(!rect||!videoRect)return;
       const scale=Math.min(videoRect.width/next.frameWidth,videoRect.height/next.frameHeight);
@@ -93,11 +115,15 @@ function Scan(){
     const analyze=()=>{
       const current=video.current;
       if(current&&current.readyState>=2&&current.videoWidth>1&&!document.hidden&&!pending){
-        canvas.width=480; canvas.height=Math.max(160,Math.round(480*current.videoHeight/current.videoWidth));
-        context.drawImage(current,0,0,canvas.width,canvas.height); const frame=context.getImageData(0,0,canvas.width,canvas.height); pending=true;
-        worker.postMessage({data:frame.data.buffer,width:canvas.width,height:canvas.height},[frame.data.buffer]);
+        // Keep the analysis frame small and reuse the same backing canvas. This
+        // materially reduces getImageData allocations on mid-range phones.
+        const targetWidth=320;
+        const nextHeight=Math.max(160,Math.round(targetWidth*current.videoHeight/current.videoWidth));
+        if(analysisWidth!==targetWidth||analysisHeight!==nextHeight){canvas.width=targetWidth;canvas.height=nextHeight;analysisWidth=targetWidth;analysisHeight=nextHeight}
+        context.drawImage(current,0,0,analysisWidth,analysisHeight); const frame=context.getImageData(0,0,analysisWidth,analysisHeight); pending=true;
+        worker.postMessage({data:frame.data.buffer,width:analysisWidth,height:analysisHeight},[frame.data.buffer]);
       }
-      timer=window.setTimeout(analyze,160);
+      timer=window.setTimeout(analyze,180);
     };
     worker.onmessage=(event:MessageEvent<Detection>)=>{
       const next=event.data; const previous=smoothed;
@@ -107,17 +133,40 @@ function Scan(){
       }else smoothed=next;
       pending=false; latestDetection.current=smoothed; setDetection(smoothed); updateGuide(smoothed);
     };
+    const visibility=()=>{
+      if(document.hidden){window.clearTimeout(timer);video.current?.pause();return}
+      if(video.current){void video.current.play().catch(()=>undefined)}
+      analyze();
+    };
+    document.addEventListener('visibilitychange',visibility);
     analyze();
-    return()=>{window.clearTimeout(timer);worker.terminate()};
+    return()=>{window.clearTimeout(timer);document.removeEventListener('visibilitychange',visibility);worker.terminate()};
   },[stream]);
-  return <main className="scanner"><div className="scanner-top"><Link to="/library" aria-label="Close scanner"><X/></Link><span>Live document detection</span><button disabled={!stream} onClick={stopCamera}>Stop camera</button></div><div className="viewfinder">{stream?<video ref={video} playsInline muted/>:<div className="camera-intro"><Camera size={46}/><h1>Ready when you are</h1><p>Camera access starts only after you choose it. The outline follows the page; capture stays manual.</p><button className="primary" onClick={()=>void start()}>Enable camera</button></div>}{stream&&<div className={`crop-guide ${detection?.guidance==='ready'?'stable':''}`} aria-hidden="true"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon points={guidePoints}/></svg></div>}</div><p className="scanner-status" role="status">{error||(!stream?'Enable the camera or import a document to begin.':!detection?'Analyzing the page locally':detection.guidance==='ready'?'Page found  tap capture when you are ready.':detection.guidance==='move-closer'?'Move closer so the page fills more of the frame.':'Searching for the four page edges. You can capture manually.')}</p><div className="scanner-controls"><input ref={input} hidden type="file" accept="image/*" capture="environment" onChange={e=>{const file=e.target.files?.[0];if(file)void save(file,'image-import');e.currentTarget.value=''}}/><button onClick={()=>input.current?.click()}><ImagePlus/> Import</button><button className="capture" disabled={!stream||busy} onClick={()=>void capture()} aria-label="Capture document"><span/></button><button onClick={()=>nav('/library')}><FolderOpen/> Library</button></div></main>
+  return <main className="scanner"><div className="scanner-top"><Link to="/library" aria-label="Close scanner"><X/></Link><span>Live document detection</span><div className="scanner-top-actions"><button disabled={!stream||!torchSupported} onClick={()=>void toggleTorch()} aria-label={torchOn?'Turn flash off':'Turn flash on'} title={torchSupported?(torchOn?'Turn flash off':'Turn flash on'):'Flash unavailable on this camera'}>{torchOn?<FlashlightOff/>:<Flashlight/>}</button><button disabled={!stream} onClick={stopCamera}>Stop camera</button></div></div><div className="viewfinder">{stream?<video ref={video} playsInline muted/>:<div className="camera-intro"><Camera size={46}/><h1>Ready when you are</h1><p>Camera access starts only after you choose it. The outline follows the page; capture stays manual.</p><button className="primary" onClick={()=>void start()}>Enable camera</button></div>}{stream&&<div className={`crop-guide ${detection?.guidance==='ready'?'stable':''}`} aria-hidden="true"><svg viewBox="0 0 100 100" preserveAspectRatio="none"><polygon points={guidePoints}/></svg></div>}</div><p className="scanner-status" role="status">{error||(!stream?'Enable the camera or import a document to begin.':!detection?'Analyzing the page locally':detection.guidance==='ready'?'Page found  tap capture when you are ready.':detection.guidance==='move-closer'?'Move closer so the page fills more of the frame.':'Searching for the four page edges. You can capture manually.')}</p><div className="scanner-controls"><input ref={input} hidden type="file" accept="image/*" capture="environment" onChange={e=>{const file=e.target.files?.[0];if(file)void save(file,'image-import');e.currentTarget.value=''}}/><button onClick={()=>input.current?.click()}><ImagePlus/> Import</button><button className="capture" disabled={!stream||busy} onClick={()=>void capture()} aria-label="Capture document"><span/></button><button onClick={()=>nav('/library')}><FolderOpen/> Library</button></div></main>
 }
 
 function findDoc(items:LibraryItem[],id:string){return items.find(x=>x.document.id===id)}
-function Workspace(){const {documentId}=useParams();const {items,loading,refresh}=useLibrary();const nav=useNavigate();const found=documentId?findDoc(items,documentId):undefined;const [selected,setSelected]=useState<string>();useEffect(()=>{if(found&&!selected)setSelected(found.pages[0]?.id)},[found,selected]);if(loading)return <Shell><p className="loading"><LoaderCircle/> Loading document</p></Shell>;if(!found)return <Navigate to="/library" replace/>;const page=found.pages.find(p=>p.id===selected)??found.pages[0];const mutate=async(changed:Page,filter?:Filter)=>{const original=await storage.blob(changed,false);const processed=await processImage(original,filter??changed.filter,changed.rotation);changed.filter=filter??changed.filter;changed.updatedAt=now();await storage.savePage(changed,undefined,processed);await storage.saveDocument({...found.document,updatedAt:now()});await refresh()};const rotate=()=>page&&void mutate({...page,rotation:((page.rotation+90)%360) as 0|90|180|270});const crop=async()=>{if(!page)return;const original=await storage.blob(page,false);const cropped=await cropImage(original);await storage.savePage({...page,width:Math.round(page.width*.84),height:Math.round(page.height*.84),updatedAt:now()},undefined,cropped);await refresh()};return <Shell><main className="workspace"><div className="workspace-bar"><Link className="back" to="/library"><ChevronLeft/> Library</Link><input aria-label="Document title" value={found.document.title} onChange={async e=>{const d={...found.document,title:e.target.value,updatedAt:now()};await storage.saveDocument(d);await refresh()}}/><div><Link className="tool" to={`/document/${found.document.id}/text`}><Type/> Text</Link><Link className="tool" to={`/document/${found.document.id}/export`}><Download/> Export</Link><Link className="tool" to={`/document/${found.document.id}/print`}><Printer/> Print</Link></div></div><div className="editor"><aside className="pages"><Link className="add-page" to={`/scan?documentId=${found.document.id}`}><ImagePlus/> Add page</Link>{found.pages.map((p,i)=><button className={p.id===page?.id?'page-thumb selected':'page-thumb'} onClick={()=>setSelected(p.id)} key={p.id}><span>{i+1}</span><FileText/><small>{p.filter}</small></button>)}</aside><section className="canvas">{page?<PageImage page={page}/>:null}</section><aside className="inspector"><h2>Page {page?found.pages.indexOf(page)+1:0}</h2><div className="filter-list">{(['original','document','black-white','receipt','whiteboard'] as Filter[]).map(f=><button className={page?.filter===f?'active':''} key={f} onClick={()=>page&&void mutate({...page},f)}>{f.replace('-',' ')}</button>)}</div><button className="secondary" onClick={rotate}><RotateCw/> Rotate right</button><button className="secondary" onClick={()=>void crop()}>Crop to frame</button><button className="secondary danger" onClick={async()=>{if(!page||!confirm('Delete this page?'))return;const pages=found.pages.filter(x=>x.id!==page.id).map((x,i)=>({...x,order:i}));for(const p of pages)await storage.savePage(p);await storage.saveDocument({...found.document,pageIds:pages.map(x=>x.id),updatedAt:now()});if(pages.length===0){await storage.remove(found.document.id);nav('/library')}else{setSelected(pages[0].id);await refresh()}}}><Trash2/> Delete page</button></aside></div></main></Shell>}
-function PageImage({page}:{page:Page}){const [url,setUrl]=useState('');useEffect(()=>{let u='';void storage.blob(page).then(b=>{u=URL.createObjectURL(b);setUrl(u)});return()=>{if(u)URL.revokeObjectURL(u)}},[page]);return url?<><img className="document-image" src={url} alt="Selected scanned page" style={{transform:`rotate(${page.rotation}deg)`}}/><ShareButton page={page}/></>:<LoaderCircle className="spin"/>}
+function Workspace(){
+  const {documentId}=useParams(); const {items,loading,refresh}=useLibrary(); const nav=useNavigate();
+  const found=documentId?findDoc(items,documentId):undefined; const [selected,setSelected]=useState<string>();
+  useEffect(()=>{if(found&&!selected)setSelected(found.pages[0]?.id)},[found,selected]);
+  if(loading)return <Shell><p className="loading"><LoaderCircle/> Loading document</p></Shell>;
+  if(!found)return <Navigate to="/library" replace/>;
+  const page=found.pages.find(x=>x.id===selected)??found.pages[0];
+  const mutate=async(changed:Page,filter?:Filter)=>{
+    const original=await storage.blob(changed,false); const nextFilter=filter??changed.filter;
+    const processed=await processImage(original,nextFilter,changed.rotation);
+    changed.filter=nextFilter; changed.updatedAt=now();
+    await storage.savePage(changed,undefined,processed); await storage.saveDocument({...found.document,updatedAt:now()}); await refresh();
+  };
+  const rotate=()=>page&&void mutate({...page,rotation:((page.rotation+90)%360) as 0|90|180|270});
+  const crop=async()=>{if(!page)return; const original=await storage.blob(page,false); const cropped=await cropImage(original); const dims=await imageDimensions(cropped); const next={...page,width:dims.width,height:dims.height,filter:'original' as Filter,updatedAt:now()}; await storage.savePage(next,cropped,cropped); await refresh()};
+  const removePage=async()=>{if(!page||!confirm('Delete this page?'))return; const pages=found.pages.filter(x=>x.id!==page.id).map((x,i)=>({...x,order:i})); for(const item of pages)await storage.savePage(item); await storage.saveDocument({...found.document,pageIds:pages.map(x=>x.id),updatedAt:now()}); if(pages.length===0){await storage.remove(found.document.id);nav('/library')}else{setSelected(pages[0].id);await refresh()}};
+  return <Shell><main className="workspace"><div className="workspace-bar"><Link className="back" to="/library"><ChevronLeft/> Library</Link><input aria-label="Document title" value={found.document.title} onChange={async e=>{await storage.saveDocument({...found.document,title:e.target.value,updatedAt:now()});await refresh()}}/><div><Link className="tool" to={`/document/${found.document.id}/text`}><Type/> Text</Link><Link className="tool" to={`/document/${found.document.id}/export`}><Download/> Export</Link><Link className="tool" to={`/document/${found.document.id}/print`}><Printer/> Print</Link></div></div><div className="editor"><aside className="pages"><Link className="add-page" to={`/scan?documentId=${found.document.id}`}><ImagePlus/> Add page</Link>{found.pages.map((item,i)=><button className={item.id===page?.id?'page-thumb selected':'page-thumb'} onClick={()=>setSelected(item.id)} key={item.id}><span>{i+1}</span><FileText/><small>{filterLabel(item.filter)}</small></button>)}</aside><section className="canvas">{page?<PageImage page={page}/>:null}</section><aside className="inspector"><h2>Page {page?found.pages.indexOf(page)+1:0}</h2><div className="filter-list">{visibleFilters.map(f=><button className={canonicalFilter(page?.filter??'original')===f?'active':''} key={f} onClick={()=>page&&void mutate({...page},f)}>{filterLabel(f)}</button>)}</div><button className="secondary" onClick={rotate}><RotateCw/> Rotate right</button><button className="secondary" onClick={()=>void crop()}>Crop to frame</button><button className="secondary danger" onClick={()=>void removePage()}><Trash2/> Delete page</button></aside></div></main></Shell>;
+}
+function PageImage({page}:{page:Page}){const [url,setUrl]=useState('');const isOriginal=page.filter==='original';useEffect(()=>{let u='';void storage.blob(page,!isOriginal).then(b=>{u=URL.createObjectURL(b);setUrl(u)});return()=>{if(u)URL.revokeObjectURL(u)}},[page,isOriginal]);return url?<><img className="document-image" src={url} alt="Selected scanned page" style={isOriginal?{transform:`rotate(${page.rotation}deg)`}:undefined}/><ShareButton page={page}/></>:<LoaderCircle className="spin"/>}
 function ShareButton({page}:{page:Page}){const {items}=useLibrary();const record=items.find(item=>item.document.id===page.documentId);const [busy,setBusy]=useState(false);const share=async()=>{if(!record)return;setBusy(true);try{const blob=await buildPdf(record.document,record.pages);const file=new File([blob],`${record.document.title.replace(/[^a-z0-9-_]+/gi,'-')}.pdf`,{type:'application/pdf'});if(!navigator.share||!navigator.canShare?.({files:[file]})){return}await navigator.share({title:record.document.title,files:[file]})}catch(error){if(error instanceof Error&&error.name!=='AbortError')console.warn(error)}finally{setBusy(false)}};return <button className="secondary share-inline" disabled={busy||!record} onClick={()=>void share()}>{busy?<LoaderCircle className="spin"/>:<Download/>} Share PDF to another app</button>}
 function DocumentAction({kind}:{kind:'text'|'export'|'print'}){const {documentId}=useParams();const {items,loading,refresh}=useLibrary();const found=documentId?findDoc(items,documentId):undefined;const [running,setRunning]=useState(false);const [message,setMessage]=useState('');const [format,setFormat]=useState(kind==='export'?'pdf':'');if(loading)return <Shell><p className="loading">Loading</p></Shell>;if(!found)return <Navigate to="/library"/>;const back=`/document/${found.document.id}`;const run=async()=>{setRunning(true);try{if(kind==='text'){for(const page of found.pages){const blob=await storage.blob(page);const out=await recognize(blob,'eng',()=>undefined);await storage.savePage({...page,text:out.text,ocrStatus:out.confidence<60?'low-confidence':'complete',ocrAverageConfidence:out.confidence,ocrPath:'ocr.json'})}await storage.saveDocument({...found.document,ocrStatus:'complete',updatedAt:now()});await refresh();setMessage('OCR is complete. You can edit the recognized text below.')}else if(kind==='export'){await exportFile(found.document,found.pages,format);setMessage('Your export was prepared locally.')}else{window.print();setMessage('The browser opened its system print dialog. LocalScan cannot silently select a printer or print without your confirmation.')}}catch(e){setMessage(e instanceof Error?e.message:'The local operation could not complete.')}finally{setRunning(false)}};return <Shell><main className="action-page"><Link className="back" to={back}><ChevronLeft/> Back to document</Link><div className="action-panel"><h1>{kind==='text'?'Recognize and edit text':kind==='export'?'Export document':'Print document'}</h1>{kind==='text'?<><p>OCR runs in a local WebAssembly worker. Language assets are cached by the browser after their first load.</p><button className="primary" disabled={running} onClick={()=>void run()}>{running?<LoaderCircle className="spin"/>:<Type/>} Run English OCR</button>{found.pages.map(p=><textarea key={p.id} aria-label={`Recognized text for page ${p.order+1}`} defaultValue={p.text??''} onBlur={async e=>{await storage.savePage({...p,text:e.target.value,ocrStatus:'complete',ocrPath:'ocr.json'});await refresh()}} placeholder={`Recognized text for page ${p.order+1} will appear here.`}/>)}</>:kind==='export'?<><p>All exports use processed, full-resolution pages  never thumbnails.</p><div className="format-grid">{['pdf','searchable','text-pdf','docx','editable-docx','png','jpeg','webp','zip'].map(x=><button className={format===x?'active':''} onClick={()=>setFormat(x)} key={x}>{x.replaceAll('-',' ')}</button>)}</div><button className="primary" disabled={running||!format} onClick={()=>void run()}>{running?<LoaderCircle className="spin"/>:<Download/>} Export {format.toUpperCase()}</button></>:<><p>Preview is limited to document pages. Your browser controls printer selection and confirmation.</p><div className="print-preview">{found.pages.map(p=><PageImage key={p.id} page={p}/>)}</div><button className="primary" onClick={()=>void run()}><Printer/> Open print dialog</button></>}{message&&<p className="notice" role="status">{message}</p>}</div></main></Shell>}
-function SettingsPage(){const [usage,setUsage]=useState<{usage?:number;quota?:number}>({});const [persisted,setPersisted]=useState(false);useEffect(()=>{void storage.estimate().then(setUsage);void navigator.storage.persisted?.().then(setPersisted)},[]);return <Shell><main className="settings-page"><h1>Storage and privacy</h1><section><ShieldCheck/><div><h2>Stored only on this device</h2><p>Your documents are saved in your browsers private local storage. Clearing this sites browser data can permanently remove them. Export important documents for backup.</p></div></section><section><FileText/><div><h2>Local storage</h2><p>{usage.usage?`${(usage.usage/1024/1024).toFixed(1)} MB used of ${((usage.quota??0)/1024/1024/1024).toFixed(1)} GB available`:'Storage estimate unavailable.'}</p><button className="secondary" disabled={persisted} onClick={async()=>setPersisted(await storage.persist())}>{persisted?'Persistent storage enabled':'Request persistent storage'}</button></div></section><section><MoreHorizontal/><div><h2>Browser support</h2><p>{storage.supported()?'OPFS is available for durable local documents.':'OPFS is unavailable in this browser; storage cannot be guaranteed.'} Camera and printing depend on browser and hardware support.</p></div></section></main></Shell>}
+function SettingsPage(){const [usage,setUsage]=useState<{usage?:number;quota?:number}>({});const [persisted,setPersisted]=useState(false);const [message,setMessage]=useState('');const [clearing,setClearing]=useState(false);const refreshUsage=async()=>{setUsage(await storage.estimate());if(navigator.storage?.persisted)setPersisted(await navigator.storage.persisted())};useEffect(()=>{void refreshUsage()},[]);const clearLocal=async()=>{if(!window.confirm('Delete every locally stored document and image? This cannot be undone.'))return;setClearing(true);setMessage('');try{await storage.clear();await refreshUsage();setMessage('Local documents cleared from this browser.')}catch(error){setMessage(error instanceof Error?error.message:'Could not clear local documents.')}finally{setClearing(false)}};const used=typeof usage.usage==='number'?`${(usage.usage/1024/1024).toFixed(1)} MB used${typeof usage.quota==='number'?` of ${(usage.quota/1024/1024/1024).toFixed(1)} GB available`:''}`:'Storage estimate unavailable.';return <Shell><main className="settings-page"><h1>Storage and privacy</h1><section><ShieldCheck/><div><h2>Stored only on this device</h2><p>LocalScan never uploads scans. Images and document data stay in this browser's private, browser-managed local storage. Clearing this site's browser data can permanently remove them.</p><p className="settings-status">Storage location: {storage.mode()}</p></div></section><section><FileText/><div><h2>Local storage</h2><p>{used}</p><button className="secondary" disabled={persisted} onClick={async()=>{setPersisted(await storage.persist());setMessage('The browser was asked to keep LocalScan data available.')}}>{persisted?'Persistent storage enabled':'Keep documents available'}</button><button className="secondary danger" disabled={clearing} onClick={()=>void clearLocal()}>{clearing?'Clearing local data…':'Clear all local documents'}</button></div></section><section><MoreHorizontal/><div><h2>Browser support</h2><p>{storage.supported()?'The browser supports OPFS for durable local documents.':'This browser is using IndexedDB for local document storage.'} Camera and printing depend on browser and hardware support.</p></div></section>{message&&<p className="notice" role="status">{message}</p>}</main></Shell>}
 function Help(){return <Shell><main className="help"><h1>How LocalScan handles your documents</h1><p>There is no account, server, remote database, analytics, or document upload. Camera access begins only when you press Enable camera. If automatic scanning is unavailable, import an image or capture manually.</p><p>Printing always uses the system print dialog. Browser security does not allow silent printing or automatic printer selection.</p></main></Shell>}
 export default function App(){return <Routes><Route path="/" element={<Navigate to="/library" replace/>}/><Route path="/library" element={<Library/>}/><Route path="/scan" element={<Scan/>}/><Route path="/scan/:sessionId" element={<Scan/>}/><Route path="/document/:documentId" element={<Workspace/>}/><Route path="/document/:documentId/text" element={<DocumentAction kind="text"/>}/><Route path="/document/:documentId/export" element={<DocumentAction kind="export"/>}/><Route path="/document/:documentId/print" element={<DocumentAction kind="print"/>}/><Route path="/settings" element={<SettingsPage/>}/><Route path="/storage" element={<SettingsPage/>}/><Route path="/help" element={<Help/>}/><Route path="*" element={<Navigate to="/library" replace/>}/></Routes>}

@@ -1,6 +1,8 @@
 import { z } from 'zod'
 
-export const FilterSchema = z.enum(['original', 'document', 'black-white', 'receipt', 'whiteboard'])
+// Keep legacy names readable for existing local manifests while exposing the
+// user-facing choices as Original, Enhance, and Monotone.
+export const FilterSchema = z.enum(['original', 'enhance', 'monotone', 'document', 'black-white', 'receipt', 'whiteboard'])
 export type Filter = z.infer<typeof FilterSchema>
 export const OcrStatusSchema = z.enum(['not-requested', 'queued', 'processing', 'complete', 'low-confidence', 'failed', 'cancelled'])
 export type OcrStatus = z.infer<typeof OcrStatusSchema>

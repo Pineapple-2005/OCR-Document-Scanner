@@ -109,7 +109,7 @@ function pointInPolygon(point: Point, polygon: Point[]) {
 }
 
 function detectDocument(pixels: Uint8ClampedArray, width: number, height: number): Detection {
-  const maxDimension = 280
+  const maxDimension = 220
   const scale = Math.min(1, maxDimension / Math.max(width, height))
   const smallWidth = Math.max(80, Math.round(width * scale))
   const smallHeight = Math.max(60, Math.round(height * scale))
@@ -142,7 +142,7 @@ function detectDocument(pixels: Uint8ClampedArray, width: number, height: number
   const edgeDensity = edgePixels / Math.max(1, (smallWidth - 2) * (smallHeight - 2))
 
   const diagonal = Math.hypot(smallWidth, smallHeight)
-  const thetaCount = 90 // 2-degree angular resolution; enough for handheld skew.
+  const thetaCount = 72 // 2.5-degree angular resolution; keeps live analysis responsive.
   const rhoBins = Math.ceil(diagonal * 2) + 1
   const rhoOffset = diagonal
   const accumulator = new Float32Array(thetaCount * rhoBins)
@@ -182,7 +182,7 @@ function detectDocument(pixels: Uint8ClampedArray, width: number, height: number
     // compact set of real page/text lines for the pair search below.
     if (lines.some(line => orientationDistance(line.theta, peak.theta) < 0.12 && Math.abs(line.rho - peak.rho) < 14)) continue
     lines.push(peak)
-    if (lines.length >= 36) break
+    if (lines.length >= 28) break
   }
 
   const minSide = Math.min(smallWidth, smallHeight) * 0.16
