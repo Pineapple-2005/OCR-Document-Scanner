@@ -110,6 +110,7 @@ a { color: inherit; }
 .print-preview { max-height: 300px; display: flex; gap: 12px; overflow: auto; margin: 20px 0; padding: 18px; background: #e8ede8; }
 .print-preview .document-image { max-width: 180px; max-height: 250px; }
 .share-inline { width: 100%; margin-top: 14px; font-size: 13px; }
+.share-status { margin: 8px 0 0; color: #536560; font-size: 12px; line-height: 1.4; }
 
 .settings-page, .help { max-width: 880px; }
 .settings-page h1, .help h1 { margin: 24px 0 36px; }
