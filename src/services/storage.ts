@@ -34,8 +34,9 @@ export const storage = {
       await new Promise<void>((resolve, reject) => { const tx = db.transaction('records', 'readwrite'); tx.objectStore('records').clear(); tx.oncomplete = () => resolve(); tx.onerror = () => reject(tx.error) })
       return
     }
-    const r = await root(); const docs = await dir(r, 'documents')
-    for await (const [name] of docs.entries()) await docs.removeEntry(name, { recursive: true })
+    const r = await root(); const docs = await dir(r, 'documents'); const names: string[] = []
+    for await (const [name] of docs.entries()) names.push(name)
+    for (const name of names) await docs.removeEntry(name, { recursive: true })
   },
   async estimate() { return navigator.storage?.estimate?.() ?? {} },
   async persist() { return navigator.storage?.persist?.() ?? false }
